@@ -1,0 +1,68 @@
+# =====================================================================
+# Relais des votes de l'Assemblée nationale pour epocinfo.fr (22/11/2026)
+# ---------------------------------------------------------------------
+# Le serveur OVH du site ne peut pas joindre le site de l'Assemblée.
+# Ce programme tourne chez GitHub toutes les 15 minutes : il recopie les
+# dernières pages de vote de l'Assemblée sur la branche « miroir » de ce
+# dépôt, où le site epocinfo.fr va les lire.
+# À placer dans le dépôt sous : .github/workflows/miroir.yml
+# =====================================================================
+name: Miroir Assemblée nationale
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miroir
+  cancel-in-progress: false
+
+jobs:
+  miroir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UA: "Mozilla/5.0 (compatible; EPOCinfo-votes/1.0; +https://epocinfo.fr)"
+      LEG: "17"
+      GARDER: "60"
+    steps:
+      - name: Recopier les pages de vote
+        run: |
+          set -u
+          mkdir -p ancien out
+          # Copie précédente : seules les pages manquantes seront téléchargées
+          if git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/miroir >/dev/null 2>&1; then
+            git clone -q --depth 1 --branch miroir "https://github.com/${GITHUB_REPOSITORY}.git" ancien
+          fi
+          curl -sfL --retry 3 -A "$UA" "https://www.assemblee-nationale.fr/dyn/$LEG/scrutins" -o liste.html \
+            || { echo "Liste des scrutins inaccessible"; exit 1; }
+          max=$(grep -o "href=\"/dyn/$LEG/scrutins/[0-9]*\"" liste.html | grep -o '[0-9][0-9][0-9]*"' | tr -d '"' | sort -n | tail -1)
+          [ -n "$max" ] || { echo "Aucun numéro de scrutin trouvé"; exit 1; }
+          echo "Dernier scrutin : $max"
+          for n in $(seq $((max - GARDER + 1)) "$max"); do
+            f="scrutin_$n.html"
+            if [ -s "ancien/$f" ]; then cp "ancien/$f" out/; continue; fi
+            if curl -sfL --retry 3 -A "$UA" "https://www.assemblee-nationale.fr/dyn/$LEG/scrutins/$n" -o page.html; then
+              # On ne garde que la partie utile (en-tête du vote -> détail par groupe)
+              perl -0777 -ne 'print $1 if /(data-id="VTANR.*?Votes des groupes)/s' page.html > "out/$f"
+              grep -q 'Répartition des votes par groupe' "out/$f" || rm -f "out/$f"   # page incomplète : nouvel essai au prochain passage
+            fi
+            sleep 0.3
+          done
+          echo "$max" > out/dernier.txt
+          date -u +%Y-%m-%dT%H:%M:%SZ > out/maj.txt
+          ls out | wc -l
+
+      - name: Publier sur la branche miroir
+        run: |
+          cd out
+          git init -q -b miroir
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "Miroir jusqu'au scrutin $(cat dernier.txt)"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" miroir
